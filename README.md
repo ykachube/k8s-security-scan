@@ -52,9 +52,9 @@ No Helm chart, no operator, no side-car — just **one script and one `pip insta
 pip install kubernetes
 
 # 2. Download the scanner
-curl -O https://raw.githubusercontent.com/your-repo/k8s_security_audit.py
+curl -O https://raw.githubusercontent.com/ykachube/k8s-security-scan/k8s_security_audit.py
 # or clone this repo
-git clone https://github.com/your-repo/k8s-security-audit
+git clone https://github.com/ykachube/k8s-security-scan
 
 # 3. Make it executable (optional)
 chmod +x k8s_security_audit.py
