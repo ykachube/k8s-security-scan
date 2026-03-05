@@ -74,15 +74,63 @@ python k8s_security_audit.py --context staging-cluster
 # Limit scan to specific namespaces
 python k8s_security_audit.py --namespaces default app-ns monitoring
 
+# Exclude namespaces entirely (no findings generated for them at all)
+python k8s_security_audit.py --skip-namespaces monitoring logging
+
 # Save a full JSON report alongside the terminal output
 python k8s_security_audit.py --output report.json
 
 # Print JSON only (no colours) — useful for piping
 python k8s_security_audit.py --json-only | jq '.findings[] | select(.severity == "CRITICAL")'
 
+# Hide the infrastructure components section from terminal output
+python k8s_security_audit.py --hide-infra
+
 # Combine options
 python k8s_security_audit.py --context prod --namespaces backend --output prod-audit.json
 ```
+
+### CLI Flags Reference
+
+| Flag | Description |
+|---|---|
+| `--context` | kubeconfig context to use |
+| `--namespaces NS [NS ...]` | Scan only these namespaces |
+| `--skip-namespaces NS [NS ...]` | Exclude these namespaces entirely — no findings generated |
+| `--output FILE` | Save full JSON report (includes infra findings) |
+| `--json-only` | Print JSON to stdout, no coloured terminal output |
+| `--hide-infra` | Suppress the grey infrastructure section from terminal output |
+
+---
+
+### Infrastructure Workload Handling
+
+Many system-level workloads **legitimately require** elevated privileges that the scanner would otherwise flag as CRITICAL or HIGH — Calico needs `privileged: true` to manage eBPF/iptables, kube-proxy needs `hostNetwork`, CSI drivers need `SYS_ADMIN`, etc.
+
+Rather than suppressing these or producing false CRITICAL alerts that bury real findings, the scanner handles them like this:
+
+- Findings for known infrastructure workloads are **tagged `is_infra: true`**
+- They are shown in a **separate grey section** at the bottom of the terminal output, clearly labelled *"System / Infrastructure Components"*
+- Their **original severity is preserved** in the JSON report under `infra_findings`
+- **Exit codes and the main summary count only real (non-infra) findings**
+
+Namespaces always treated as infrastructure: `kube-system`, `kube-public`, `kube-node-lease`, `cert-manager`
+
+Known infrastructure workload names (partial match):
+
+```
+calico-node, calico-typha, calico-kube-controllers
+cilium, cilium-operator, kube-flannel-ds, weave-net
+kube-proxy, coredns
+csi-cinder-nodeplugin, csi-cinder-controllerplugin, ebs-csi-*, gce-pd-csi-driver
+openstack-cloud-controller-manager, aws-cloud-controller-manager, azure-cloud-controller-manager
+metrics-server, cert-manager, cert-manager-cainjector, cert-manager-webhook
+ingress-nginx-controller, local-path-provisioner, nfs-subdir-external-provisioner
+```
+
+To add your own, edit the `INFRA_WORKLOAD_NAMES` set near the top of the script.
+
+---
 
 ### Required Permissions
 

@@ -2,16 +2,18 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║        Kubernetes Security Audit Scanner  –  Versatech Edition             ║
-║  Based on: ReynardSec  K8s Security Guide, CIS Benchmark, NSA/CISA Guide     ║
+║  Based on: ReynardSec K8s Security Guide, CIS Benchmark, NSA/CISA Guide     ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 Usage:
     pip install kubernetes
-    python k8s_security_audit.py                          # current context
-    python k8s_security_audit.py --context my-ctx         # specific context
-    python k8s_security_audit.py --namespaces default ns2 # limit namespaces
-    python k8s_security_audit.py --output report.json     # save JSON report
-    python k8s_security_audit.py --json-only              # JSON to stdout
+    python k8s_security_audit.py                               # current context
+    python k8s_security_audit.py --context my-ctx              # specific context
+    python k8s_security_audit.py --namespaces default ns2      # limit namespaces
+    python k8s_security_audit.py --skip-namespaces monitoring  # exclude namespaces
+    python k8s_security_audit.py --output report.json          # save JSON report
+    python k8s_security_audit.py --json-only                   # JSON to stdout
+    python k8s_security_audit.py --hide-infra                  # suppress infra section
 """
 
 import argparse
@@ -53,22 +55,24 @@ _C = {
     Severity.LOW:      "\033[36m",
     Severity.INFO:     "\033[37m",
 }
-RESET = "\033[0m"
-BOLD  = "\033[1m"
-DIM   = "\033[2m"
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+GREY   = "\033[38;5;245m"   # mid-grey for infra findings
 
 
 @dataclass
 class Finding:
     check_id:    str
-    severity:    Severity
+    severity:    Severity           # original severity — preserved in JSON
     category:    str
     title:       str
     resource:    str
     namespace:   Optional[str]
     detail:      str
     remediation: str
-    reference:   str = ""
+    reference:   str  = ""
+    is_infra:    bool = False       # True  → known system workload, shown separately
 
     def to_dict(self):
         d = asdict(self)
@@ -84,19 +88,33 @@ class AuditReport:
     def add(self, finding: Finding):
         self.findings.append(finding)
 
+    # ── counts split by is_infra ──────────────────────────────────────────────
+
     def summary(self):
+        """Counts for real (non-infra) findings only."""
         counts = {s.value: 0 for s in Severity}
         for f in self.findings:
-            counts[f.severity.value] += 1
+            if not f.is_infra:
+                counts[f.severity.value] += 1
+        return counts
+
+    def infra_summary(self):
+        """Counts for infra findings (displayed separately)."""
+        counts = {s.value: 0 for s in Severity}
+        for f in self.findings:
+            if f.is_infra:
+                counts[f.severity.value] += 1
         return counts
 
     def to_dict(self):
+        real  = [f for f in self.findings if not f.is_infra]
+        infra = [f for f in self.findings if f.is_infra]
         return {
-            "cluster_context": self.cluster_context,
-            "summary": self.summary(),
-            "findings": [f.to_dict() for f in sorted(
-                self.findings, key=lambda x: SEVERITY_ORDER[x.severity]
-            )],
+            "cluster_context":  self.cluster_context,
+            "summary":          self.summary(),
+            "infra_summary":    self.infra_summary(),
+            "findings":         [f.to_dict() for f in sorted(real,  key=lambda x: SEVERITY_ORDER[x.severity])],
+            "infra_findings":   [f.to_dict() for f in sorted(infra, key=lambda x: SEVERITY_ORDER[x.severity])],
         }
 
 
@@ -113,14 +131,65 @@ def safe_call(fn, *args, default=None, **kwargs):
         raise
 
 
-# Capabilities considered dangerous when explicitly added to a container
+# Capabilities considered dangerous when explicitly added
 DANGEROUS_CAPS = {
     "SYS_ADMIN", "SYS_PTRACE", "SYS_MODULE", "SYS_RAWIO",
     "NET_ADMIN",  "NET_RAW",    "SYS_CHROOT", "DAC_OVERRIDE",
     "DAC_READ_SEARCH", "SETUID", "SETGID", "FOWNER", "KILL",
 }
 
+# Always-internal k8s namespaces (skipped for network/quota checks)
 SYSTEM_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease"}
+
+# ── Known infrastructure workloads ───────────────────────────────────────────
+# Findings for these workload names inside kube-system are demoted to INFO
+# and shown in a separate grey section.  They are NOT suppressed — they still
+# appear in the JSON report under "infra_findings" with their original severity.
+#
+# Add your own CNI / CSI / cloud-controller names here as needed.
+INFRA_WORKLOAD_NAMES = {
+    # CNI — Calico
+    "calico-node", "calico-typha", "calico-kube-controllers",
+    # CNI — Cilium
+    "cilium", "cilium-operator",
+    # CNI — Flannel
+    "kube-flannel-ds",
+    # CNI — Weave
+    "weave-net",
+    # Core Kubernetes components
+    "kube-proxy", "coredns",
+    # CSI drivers
+    "csi-cinder-nodeplugin", "csi-cinder-controllerplugin",
+    "csi-nfs-node", "csi-nfs-controller",
+    "ebs-csi-node", "ebs-csi-controller",
+    "gce-pd-csi-driver",
+    # Cloud controller managers
+    "openstack-cloud-controller-manager",
+    "aws-cloud-controller-manager",
+    "azure-cloud-controller-manager",
+    "cloud-controller-manager",
+    # Metrics
+    "metrics-server",
+    # cert-manager
+    "cert-manager", "cert-manager-cainjector", "cert-manager-webhook",
+    # Ingress controllers
+    "ingress-nginx-controller",
+    # Storage provisioners
+    "local-path-provisioner",
+    "nfs-subdir-external-provisioner",
+}
+
+# Namespaces whose workloads are always treated as infra
+INFRA_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease", "cert-manager"}
+
+
+def _is_infra_workload(namespace: str, workload_name: str) -> bool:
+    """Return True if this workload should be shown in the infra section."""
+    if namespace in INFRA_NAMESPACES:
+        return True
+    # also catch partial matches, e.g. "adlean-prime-ingress-ingress-nginx-controller"
+    lower = workload_name.lower()
+    return any(known in lower for known in INFRA_WORKLOAD_NAMES)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -129,25 +198,33 @@ SYSTEM_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease"}
 
 class SecurityAuditor:
 
-    def __init__(self, target_namespaces: Optional[list] = None):
-        self.report = AuditReport(cluster_context="")
+    def __init__(self,
+                 target_namespaces: Optional[list] = None,
+                 skip_namespaces:   Optional[list] = None):
+        self.report            = AuditReport(cluster_context="")
         self.target_namespaces = target_namespaces
+        self.skip_namespaces   = set(skip_namespaces or [])
         self.core  = client.CoreV1Api()
         self.apps  = client.AppsV1Api()
         self.rbac  = client.RbacAuthorizationV1Api()
         self.net   = client.NetworkingV1Api()
         self.batch = client.BatchV1Api()
 
-    # ── Namespace helpers ─────────────────────────────────────────────────────
+    # ── Namespace resolution ──────────────────────────────────────────────────
 
-    def get_namespaces(self):
+    def get_namespaces(self) -> list:
         ns_list = safe_call(self.core.list_namespace, default=None)
         if ns_list is None:
-            return self.target_namespaces or ["default"]
-        all_ns = [ns.metadata.name for ns in ns_list.items]
-        if self.target_namespaces:
-            return [n for n in all_ns if n in self.target_namespaces]
-        return all_ns
+            candidates = self.target_namespaces or ["default"]
+        else:
+            all_ns = [ns.metadata.name for ns in ns_list.items]
+            if self.target_namespaces:
+                candidates = [n for n in all_ns if n in self.target_namespaces]
+            else:
+                candidates = all_ns
+        return [n for n in candidates if n not in self.skip_namespaces]
+
+    # ── Finding helper ────────────────────────────────────────────────────────
 
     def _add(self, **kwargs):
         self.report.add(Finding(**kwargs))
@@ -165,7 +242,7 @@ class SecurityAuditor:
             if crb.role_ref.name != "cluster-admin":
                 continue
             for subj in (crb.subjects or []):
-                if subj.kind == "User" and subj.name.startswith("system:"):
+                if subj.kind == "User"  and subj.name.startswith("system:"):
                     continue
                 if subj.kind == "Group" and subj.name.startswith("system:"):
                     continue
@@ -178,7 +255,7 @@ class SecurityAuditor:
                     detail=(f"Subject '{subj.name}' ({subj.kind}) has cluster-admin privileges. "
                             "Full control of the cluster."),
                     remediation="Use least-privilege roles. Reserve cluster-admin for break-glass accounts only.",
-                    reference="Versatech § Users, Authentication and Authorization",
+                    reference="ReynardSec § Users, Authentication and Authorization",
                 )
 
     def check_rbac_wildcard_rules(self):
@@ -199,7 +276,7 @@ class SecurityAuditor:
                         namespace=None,
                         detail=f"Wildcard rule — verbs={rule.verbs}, resources={rule.resources}",
                         remediation="Replace wildcards with explicit, minimal permissions.",
-                        reference="Versatech § Authorization",
+                        reference="ReynardSec § Authorization",
                     )
 
     def check_rbac_anonymous_access(self):
@@ -219,7 +296,7 @@ class SecurityAuditor:
                         detail=(f"'{subj.name}' bound to role '{crb.role_ref.name}'. "
                                 "Anyone on the network can perform those operations without credentials."),
                         remediation="Delete this ClusterRoleBinding immediately.",
-                        reference="Versatech § Anonymous Access",
+                        reference="ReynardSec § Anonymous Access",
                     )
 
     def check_rbac_default_sa_permissions(self, namespaces):
@@ -238,15 +315,14 @@ class SecurityAuditor:
                             detail=(f"Default SA bound to '{rb.role_ref.name}'. "
                                     "All pods without an explicit SA inherit these permissions."),
                             remediation="Create dedicated per-workload ServiceAccounts.",
-                            reference="Versatech § Secrets / automountServiceAccountToken",
+                            reference="ReynardSec § Secrets / automountServiceAccountToken",
                         )
 
     # ══════════════════════════════════════════════════════════════════════════
-    # 2.  API Server flags (inspected via kube-system static pod)
+    # 2.  API Server flags
     # ══════════════════════════════════════════════════════════════════════════
 
     def _get_static_pod_args(self, name_prefix):
-        """Return (args_list, pod_name) for a static pod matching name_prefix."""
         pods = safe_call(self.core.list_namespaced_pod, "kube-system", default=None)
         if not pods:
             return [], None
@@ -262,7 +338,6 @@ class SecurityAuditor:
         args, pod_name = self._get_static_pod_args("kube-apiserver")
         if not pod_name:
             return
-
         resource = f"StaticPod/{pod_name}"
 
         def flag_value(flag):
@@ -274,7 +349,6 @@ class SecurityAuditor:
         def has_flag(flag):
             return any(flag in a for a in args)
 
-        # Anonymous auth (default is true — must be explicitly false)
         if flag_value("--anonymous-auth") != "false":
             self._add(
                 check_id="API-001", severity=Severity.CRITICAL,
@@ -283,10 +357,9 @@ class SecurityAuditor:
                 resource=resource, namespace="kube-system",
                 detail="--anonymous-auth defaults to true. Unauthenticated requests reach the API server.",
                 remediation="Set --anonymous-auth=false in /etc/kubernetes/manifests/kube-apiserver.yaml.",
-                reference="Versatech § Anonymous Access",
+                reference="ReynardSec § Anonymous Access",
             )
 
-        # Insecure HTTP port
         insecure = flag_value("--insecure-port")
         if insecure and insecure != "0":
             self._add(
@@ -296,10 +369,9 @@ class SecurityAuditor:
                 resource=resource, namespace="kube-system",
                 detail=f"--insecure-port={insecure} serves requests with no TLS or authentication.",
                 remediation="Set --insecure-port=0.",
-                reference="Versatech § Cluster Components Security",
+                reference="ReynardSec § Cluster Components Security",
             )
 
-        # AlwaysAllow authorization
         authz = flag_value("--authorization-mode") or ""
         if "AlwaysAllow" in authz:
             self._add(
@@ -309,10 +381,9 @@ class SecurityAuditor:
                 resource=resource, namespace="kube-system",
                 detail="Every API request is granted — RBAC is completely bypassed.",
                 remediation="Set --authorization-mode=Node,RBAC.",
-                reference="Versatech § Authorization",
+                reference="ReynardSec § Authorization",
             )
 
-        # ABAC still active
         if "ABAC" in authz:
             self._add(
                 check_id="API-004", severity=Severity.MEDIUM,
@@ -321,22 +392,20 @@ class SecurityAuditor:
                 resource=resource, namespace="kube-system",
                 detail="ABAC is harder to audit and maintain than RBAC.",
                 remediation="Migrate all policies to RBAC and remove ABAC from --authorization-mode.",
-                reference="Versatech § Other Authentication and Authorization Methods",
+                reference="ReynardSec § Other Authentication and Authorization Methods",
             )
 
-        # Static token file
         if has_flag("--token-auth-file"):
             self._add(
                 check_id="API-005", severity=Severity.HIGH,
                 category="API Server",
                 title="Static token file authentication enabled",
                 resource=resource, namespace="kube-system",
-                detail="--token-auth-file stores tokens in plaintext; tokens cannot be revoked without restart.",
+                detail="--token-auth-file stores tokens in plaintext; cannot be revoked without restart.",
                 remediation="Remove --token-auth-file and use certificate-based or OIDC authentication.",
-                reference="Versatech § Other Authentication and Authorization Methods",
+                reference="ReynardSec § Other Authentication and Authorization Methods",
             )
 
-        # NodeRestriction admission plugin
         admission = flag_value("--enable-admission-plugins") or ""
         if "NodeRestriction" not in admission:
             self._add(
@@ -349,7 +418,6 @@ class SecurityAuditor:
                 reference="CIS Kubernetes Benchmark 1.2.13",
             )
 
-        # Audit logging
         if not has_flag("--audit-policy-file"):
             self._add(
                 check_id="API-007", severity=Severity.HIGH,
@@ -360,10 +428,9 @@ class SecurityAuditor:
                         "and incident response is severely hampered."),
                 remediation=("Create an audit policy YAML and set --audit-policy-file, "
                              "--audit-log-path, --audit-log-maxage, --audit-log-maxbackup, --audit-log-maxsize."),
-                reference="Versatech § Auditing (STRIDE R.01, R.02)",
+                reference="ReynardSec § Auditing (STRIDE R.01, R.02)",
             )
 
-        # Encryption at rest
         if not has_flag("--encryption-provider-config"):
             self._add(
                 check_id="API-008", severity=Severity.HIGH,
@@ -374,10 +441,9 @@ class SecurityAuditor:
                         "(effectively plaintext) in etcd. Direct etcd access reveals all secrets."),
                 remediation=("Create an EncryptionConfiguration with AES-GCM or KMS provider "
                              "and set --encryption-provider-config."),
-                reference="Versatech § etcd Security (STRIDE I.06)",
+                reference="ReynardSec § etcd Security (STRIDE I.06)",
             )
 
-        # Profiling endpoint
         if flag_value("--profiling") != "false":
             self._add(
                 check_id="API-009", severity=Severity.LOW,
@@ -389,7 +455,6 @@ class SecurityAuditor:
                 reference="CIS Kubernetes Benchmark 1.2.21",
             )
 
-        # Dedicated SA key
         if not has_flag("--service-account-key-file"):
             self._add(
                 check_id="API-010", severity=Severity.MEDIUM,
@@ -406,7 +471,6 @@ class SecurityAuditor:
     # ══════════════════════════════════════════════════════════════════════════
 
     def check_scheduler_flags(self):
-        """SCH-001/002 – kube-scheduler hardening."""
         args, pod_name = self._get_static_pod_args("kube-scheduler")
         if not pod_name:
             return
@@ -420,7 +484,7 @@ class SecurityAuditor:
                 resource=resource, namespace="kube-system",
                 detail="Profiling data can be used to map cluster internals.",
                 remediation="Add --profiling=false to kube-scheduler manifest.",
-                reference="Versatech § Automated Tools / kube-bench 1.4.1",
+                reference="ReynardSec § Automated Tools / kube-bench 1.4.1",
             )
 
         if not any("--bind-address=127.0.0.1" in a for a in args):
@@ -429,7 +493,7 @@ class SecurityAuditor:
                 category="Scheduler",
                 title="kube-scheduler bind address not restricted to localhost",
                 resource=resource, namespace="kube-system",
-                detail="Scheduler healthz/metrics may be reachable from other hosts on the node network.",
+                detail="Scheduler healthz/metrics may be reachable from other hosts.",
                 remediation="Set --bind-address=127.0.0.1.",
                 reference="CIS Kubernetes Benchmark 1.4.2",
             )
@@ -439,7 +503,6 @@ class SecurityAuditor:
     # ══════════════════════════════════════════════════════════════════════════
 
     def check_controller_manager_flags(self):
-        """CTL-001…003 – controller-manager hardening."""
         args, pod_name = self._get_static_pod_args("kube-controller-manager")
         if not pod_name:
             return
@@ -483,7 +546,6 @@ class SecurityAuditor:
     # ══════════════════════════════════════════════════════════════════════════
 
     def check_etcd_flags(self):
-        """ETCD-001…003 – etcd TLS and peer authentication."""
         args, pod_name = self._get_static_pod_args("etcd")
         if not pod_name:
             return
@@ -500,7 +562,7 @@ class SecurityAuditor:
                 resource=resource, namespace="kube-system",
                 detail="Without --client-cert-auth=true, any client can connect to etcd and read all cluster data.",
                 remediation="Set --client-cert-auth=true in the etcd static pod manifest.",
-                reference="Versatech § etcd Security / CIS 2.1",
+                reference="ReynardSec § etcd Security / CIS 2.1",
             )
 
         if not has("--peer-client-cert-auth=true"):
@@ -529,14 +591,21 @@ class SecurityAuditor:
     # 6.  Pod / Workload Security Context
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _check_pod_spec(self, namespace, kind, name, spec):
+    def _check_pod_spec(self, namespace: str, kind: str, name: str, spec):
+        """
+        Evaluate all pod-level security checks.
+        Findings for known infrastructure workloads are tagged is_infra=True
+        so they appear in the separate grey section rather than the main report.
+        """
+        infra = _is_infra_workload(namespace, name)
+
         containers = list(spec.containers or [])
         if spec.init_containers:
             containers += list(spec.init_containers)
 
         pod_sc = spec.security_context or client.V1PodSecurityContext()
 
-        # PSC-001  Privileged mode ─────────────────────────────────────────────
+        # ── PSC-001  Privileged ───────────────────────────────────────────────
         for c in containers:
             sc = c.security_context
             if sc and sc.privileged:
@@ -546,12 +615,13 @@ class SecurityAuditor:
                     title="Privileged container",
                     resource=f"{kind}/{name}/{c.name}", namespace=namespace,
                     detail=("privileged=true gives root-level host access. "
-                            "Full visibility of host devices including block storage (sda, etc.)."),
+                            "Full visibility of host devices including block storage."),
                     remediation="Remove privileged: true. Grant only specific Linux capabilities needed.",
-                    reference="Versatech § Privileged and Unprivileged Modes",
+                    reference="ReynardSec § Privileged and Unprivileged Modes",
+                    is_infra=infra,
                 )
 
-        # PSC-002  Running as root ─────────────────────────────────────────────
+        # ── PSC-002  Running as root ──────────────────────────────────────────
         for c in containers:
             sc          = c.security_context
             non_root_c  = getattr(sc,     "run_as_non_root", None) if sc else None
@@ -573,10 +643,11 @@ class SecurityAuditor:
                     resource=f"{kind}/{name}/{c.name}", namespace=namespace,
                     detail="runAsNonRoot is not enforced and no non-zero UID is specified.",
                     remediation="Set securityContext.runAsNonRoot: true and runAsUser: <non-zero>.",
-                    reference="Versatech § runAsUser, runAsGroup",
+                    reference="ReynardSec § runAsUser, runAsGroup",
+                    is_infra=infra,
                 )
 
-        # PSC-003  Host namespace sharing ─────────────────────────────────────
+        # ── PSC-003  Host namespace sharing ───────────────────────────────────
         for attr, label in [
             ("host_pid",     "hostPID"),
             ("host_network", "hostNetwork"),
@@ -590,10 +661,11 @@ class SecurityAuditor:
                     resource=f"{kind}/{name}", namespace=namespace,
                     detail=f"{label}=true allows the pod to interact with host-level namespaces.",
                     remediation=f"Set {label}: false unless absolutely required.",
-                    reference="Versatech § Privileged and Unprivileged Modes",
+                    reference="ReynardSec § Privileged and Unprivileged Modes",
+                    is_infra=infra,
                 )
 
-        # PSC-004  allowPrivilegeEscalation ───────────────────────────────────
+        # ── PSC-004  allowPrivilegeEscalation ─────────────────────────────────
         for c in containers:
             sc = c.security_context
             if not sc or sc.allow_privilege_escalation is not False:
@@ -604,10 +676,11 @@ class SecurityAuditor:
                     resource=f"{kind}/{name}/{c.name}", namespace=namespace,
                     detail="Defaults to true — process can gain more privileges than its parent.",
                     remediation="Set securityContext.allowPrivilegeEscalation: false.",
-                    reference="Versatech § allowPrivilegeEscalation",
+                    reference="ReynardSec § allowPrivilegeEscalation",
+                    is_infra=infra,
                 )
 
-        # PSC-005  readOnlyRootFilesystem ─────────────────────────────────────
+        # ── PSC-005  readOnlyRootFilesystem ───────────────────────────────────
         for c in containers:
             sc = c.security_context
             if not sc or not sc.read_only_root_filesystem:
@@ -618,10 +691,11 @@ class SecurityAuditor:
                     resource=f"{kind}/{name}/{c.name}", namespace=namespace,
                     detail="Writable root FS allows attackers to drop web shells or tamper with binaries.",
                     remediation="Set securityContext.readOnlyRootFilesystem: true; use emptyDir for writes.",
-                    reference="Versatech § readOnlyRootFilesystem",
+                    reference="ReynardSec § readOnlyRootFilesystem",
+                    is_infra=infra,
                 )
 
-        # PSC-006  Resource limits ─────────────────────────────────────────────
+        # ── PSC-006  Resource limits ──────────────────────────────────────────
         for c in containers:
             res     = c.resources
             missing = []
@@ -640,14 +714,15 @@ class SecurityAuditor:
                     resource=f"{kind}/{name}/{c.name}", namespace=namespace,
                     detail=f"No limits for: {', '.join(missing)}. Risk of resource exhaustion (DoS).",
                     remediation="Set resources.limits.cpu and resources.limits.memory.",
-                    reference="Versatech § Resource Quotas (STRIDE D.01)",
+                    reference="ReynardSec § Resource Quotas (STRIDE D.01)",
+                    is_infra=infra,
                 )
 
-        # PSC-007  Image tag ───────────────────────────────────────────────────
+        # ── PSC-007  Image tag ────────────────────────────────────────────────
         for c in containers:
             image = c.image or ""
             if "@sha256:" in image:
-                continue  # pinned by digest — safe
+                continue
             tag = image.split(":")[-1] if ":" in image else "latest"
             if tag in ("latest", ""):
                 self._add(
@@ -657,10 +732,11 @@ class SecurityAuditor:
                     resource=f"{kind}/{name}/{c.name}", namespace=namespace,
                     detail=f"Image '{image}' — unpinned images lead to unpredictable deployments.",
                     remediation="Pin to a specific version tag or SHA digest.",
-                    reference="Versatech § Specifying a Specific Image Version",
+                    reference="ReynardSec § Specifying a Specific Image Version",
+                    is_infra=infra,
                 )
 
-        # PSC-008  automountServiceAccountToken ───────────────────────────────
+        # ── PSC-008  automountServiceAccountToken ────────────────────────────
         if spec.automount_service_account_token is not False:
             self._add(
                 check_id="PSC-008", severity=Severity.LOW,
@@ -669,10 +745,11 @@ class SecurityAuditor:
                 resource=f"{kind}/{name}", namespace=namespace,
                 detail="automountServiceAccountToken defaults to true — unnecessary for most workloads.",
                 remediation="Set automountServiceAccountToken: false if API access is not needed.",
-                reference="Versatech § Secrets / automountServiceAccountToken",
+                reference="ReynardSec § Secrets / automountServiceAccountToken",
+                is_infra=infra,
             )
 
-        # PSC-009  Dangerous Linux capabilities ───────────────────────────────
+        # ── PSC-009  Dangerous Linux capabilities ─────────────────────────────
         for c in containers:
             sc = c.security_context
             if sc and sc.capabilities and sc.capabilities.add:
@@ -685,11 +762,12 @@ class SecurityAuditor:
                         resource=f"{kind}/{name}/{c.name}", namespace=namespace,
                         detail=f"Container adds: {', '.join(dangerous)}",
                         remediation="Drop ALL capabilities, then add only the minimal required set.",
-                        reference="Versatech § Linux Capabilities",
+                        reference="ReynardSec § Linux Capabilities",
+                        is_infra=infra,
                     )
 
-        # PSC-010  seccompProfile ──────────────────────────────────────────────
-        pod_seccomp = getattr(pod_sc, "seccomp_profile", None)
+        # ── PSC-010  seccompProfile ───────────────────────────────────────────
+        pod_seccomp   = getattr(pod_sc, "seccomp_profile", None)
         seccomp_found = bool(pod_seccomp)
         if not seccomp_found:
             for c in containers:
@@ -705,23 +783,23 @@ class SecurityAuditor:
                 resource=f"{kind}/{name}", namespace=namespace,
                 detail="Without seccomp, all syscalls are allowed, widening the kernel attack surface.",
                 remediation="Set securityContext.seccompProfile.type: RuntimeDefault (or Localhost).",
-                reference="Versatech § Other Capabilities",
+                reference="ReynardSec § Other Capabilities",
+                is_infra=infra,
             )
 
     def check_workload_security(self, namespaces):
         for ns in namespaces:
             for kind, lister in [
-                ("Deployment",  lambda n: safe_call(self.apps.list_namespaced_deployment, n, default=None)),
-                ("DaemonSet",   lambda n: safe_call(self.apps.list_namespaced_daemon_set, n, default=None)),
+                ("Deployment",  lambda n: safe_call(self.apps.list_namespaced_deployment,  n, default=None)),
+                ("DaemonSet",   lambda n: safe_call(self.apps.list_namespaced_daemon_set,   n, default=None)),
                 ("StatefulSet", lambda n: safe_call(self.apps.list_namespaced_stateful_set, n, default=None)),
-                ("Job",         lambda n: safe_call(self.batch.list_namespaced_job, n, default=None)),
+                ("Job",         lambda n: safe_call(self.batch.list_namespaced_job,         n, default=None)),
             ]:
                 result = lister(ns)
                 for obj in (result.items if result else []):
                     self._check_pod_spec(ns, kind, obj.metadata.name,
                                          obj.spec.template.spec)
 
-            # Standalone pods (no owner)
             pods = safe_call(self.core.list_namespaced_pod, ns, default=None)
             for p in (pods.items if pods else []):
                 if not (p.metadata.owner_references or []):
@@ -732,7 +810,6 @@ class SecurityAuditor:
     # ══════════════════════════════════════════════════════════════════════════
 
     def check_network_policies(self, namespaces):
-        """NET-001/002 – Missing policies and allow-all rules."""
         for ns in namespaces:
             if ns in SYSTEM_NAMESPACES:
                 continue
@@ -747,7 +824,7 @@ class SecurityAuditor:
                             "A compromised pod can reach any service in the cluster."),
                     remediation=("Add a default-deny NetworkPolicy, then explicitly allow "
                                  "only required ingress/egress traffic."),
-                    reference="Versatech § Network Policies (STRIDE E.02)",
+                    reference="ReynardSec § Network Policies (STRIDE E.02)",
                 )
             else:
                 for np in nps.items:
@@ -761,7 +838,7 @@ class SecurityAuditor:
                                 namespace=ns,
                                 detail="An ingress rule with no 'from' selector allows traffic from everywhere.",
                                 remediation="Restrict ingress to specific podSelector/namespaceSelector/IPBlock.",
-                                reference="Versatech § Network Policies",
+                                reference="ReynardSec § Network Policies",
                             )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -769,10 +846,9 @@ class SecurityAuditor:
     # ══════════════════════════════════════════════════════════════════════════
 
     def check_secrets_in_env_vars(self, namespaces):
-        """SEC-001 – Secrets exposed as plain environment variables."""
         for ns in namespaces:
             for kind, lister in [
-                ("Deployment",  lambda n: safe_call(self.apps.list_namespaced_deployment, n, default=None)),
+                ("Deployment",  lambda n: safe_call(self.apps.list_namespaced_deployment,  n, default=None)),
                 ("StatefulSet", lambda n: safe_call(self.apps.list_namespaced_stateful_set, n, default=None)),
             ]:
                 result = lister(ns)
@@ -790,11 +866,10 @@ class SecurityAuditor:
                                             f"'{env.value_from.secret_key_ref.name}'. "
                                             "Env vars are visible in /proc and crash dumps."),
                                     remediation="Mount secrets as files via volumes instead of env vars.",
-                                    reference="Versatech § Secrets",
+                                    reference="ReynardSec § Secrets",
                                 )
 
     def check_default_service_accounts(self, namespaces):
-        """SEC-002 – Workloads using the default service account."""
         for ns in namespaces:
             deps = safe_call(self.apps.list_namespaced_deployment, ns, default=None)
             for d in (deps.items if deps else []):
@@ -807,7 +882,7 @@ class SecurityAuditor:
                         resource=f"Deployment/{d.metadata.name}", namespace=ns,
                         detail="Sharing 'default' SA makes least-privilege RBAC impossible.",
                         remediation="Create a dedicated ServiceAccount per workload.",
-                        reference="Versatech § Secrets",
+                        reference="ReynardSec § Secrets",
                     )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -815,7 +890,8 @@ class SecurityAuditor:
     # ══════════════════════════════════════════════════════════════════════════
 
     def check_workloads_in_default_namespace(self):
-        """NS-001 – Workloads deployed in the 'default' namespace."""
+        if "default" in self.skip_namespaces:
+            return
         for kind, lister in [
             ("Deployment",  lambda: safe_call(self.apps.list_namespaced_deployment,  "default", default=None)),
             ("StatefulSet", lambda: safe_call(self.apps.list_namespaced_stateful_set, "default", default=None)),
@@ -830,17 +906,16 @@ class SecurityAuditor:
                     resource=f"{kind}/{obj.metadata.name}", namespace="default",
                     detail="'default' namespace complicates RBAC scoping and NetworkPolicy management.",
                     remediation="Move workloads to dedicated, purpose-named namespaces.",
-                    reference="Versatech § Namespaces",
+                    reference="ReynardSec § Namespaces",
                 )
 
     def check_pod_security_standards(self, namespaces):
-        """NS-002 – Namespaces missing Pod Security Standards labels."""
         ns_list = safe_call(self.core.list_namespace, default=None)
         if not ns_list:
             return
         for ns in ns_list.items:
             name = ns.metadata.name
-            if name in SYSTEM_NAMESPACES:
+            if name in SYSTEM_NAMESPACES or name in self.skip_namespaces:
                 continue
             if self.target_namespaces and name not in self.target_namespaces:
                 continue
@@ -852,15 +927,14 @@ class SecurityAuditor:
                     category="Namespace",
                     title="No Pod Security Standards label on namespace",
                     resource=f"Namespace/{name}", namespace=name,
-                    detail=("Without PSS labels, no baseline or restricted security policy is enforced. "
+                    detail=("Without PSS labels, no baseline or restricted policy is enforced. "
                             "Privileged pods can be launched freely."),
                     remediation=("Add label pod-security.kubernetes.io/enforce: restricted "
                                  "(or at least baseline)."),
-                    reference="Versatech § Pod Security Standards",
+                    reference="ReynardSec § Pod Security Standards",
                 )
 
     def check_resource_quotas(self, namespaces):
-        """NS-003 – Namespaces without a ResourceQuota."""
         for ns in namespaces:
             if ns in SYSTEM_NAMESPACES:
                 continue
@@ -873,7 +947,7 @@ class SecurityAuditor:
                     resource=f"Namespace/{ns}", namespace=ns,
                     detail="A single misbehaving workload can exhaust cluster CPU/memory/storage (DoS).",
                     remediation="Create a ResourceQuota with CPU, memory, and pod count limits.",
-                    reference="Versatech § Resource Quotas (STRIDE D.01)",
+                    reference="ReynardSec § Resource Quotas (STRIDE D.01)",
                 )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -881,7 +955,6 @@ class SecurityAuditor:
     # ══════════════════════════════════════════════════════════════════════════
 
     def check_node_health(self):
-        """NODE-001 – Nodes not in Ready state (may skip security controls)."""
         nodes = safe_call(self.core.list_node, default=None)
         if not nodes:
             return
@@ -893,7 +966,7 @@ class SecurityAuditor:
                     category="Node",
                     title="Node not in Ready state",
                     resource=f"Node/{node.metadata.name}", namespace=None,
-                    detail=f"Conditions: {conditions}. An unhealthy node may skip security controls.",
+                    detail=f"Conditions: {conditions}. Unhealthy node may skip security controls.",
                     remediation="Investigate node health before applying hardening.",
                     reference="kubectl get nodes -o wide",
                 )
@@ -903,7 +976,6 @@ class SecurityAuditor:
     # ══════════════════════════════════════════════════════════════════════════
 
     def check_issued_certificates(self):
-        """CERT-001 – Approved CSRs issued to non-system users."""
         try:
             certs_api = client.CertificatesV1Api()
             csrs = safe_call(certs_api.list_certificate_signing_request, default=None)
@@ -925,7 +997,7 @@ class SecurityAuditor:
                 resource=f"CertificateSigningRequest/{csr.metadata.name}", namespace=None,
                 detail=f"Issued to: '{username}'. Verify this certificate is still required.",
                 remediation="Revoke certificates no longer needed. Audit with: kubectl get csr",
-                reference="Versatech § Verification of Granted Access",
+                reference="ReynardSec § Verification of Granted Access",
             )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -936,31 +1008,36 @@ class SecurityAuditor:
         self.report.cluster_context = context_name
         namespaces = self.get_namespaces()
 
+        skip_str = f"  {DIM}Skipping    : {', '.join(sorted(self.skip_namespaces))}{RESET}\n" \
+                   if self.skip_namespaces else ""
+
         print(f"\n{BOLD}╔══════════════════════════════════════════════╗{RESET}")
         print(f"{BOLD}║   K8s Security Audit  –  Versatech Edition  ║{RESET}")
         print(f"{BOLD}╚══════════════════════════════════════════════╝{RESET}")
         print(f"  Context    : {BOLD}{context_name}{RESET}")
-        print(f"  Namespaces : {', '.join(namespaces)}\n")
+        print(f"  Namespaces : {', '.join(namespaces)}")
+        if skip_str:
+            print(skip_str, end="")
+        print()
 
         checks = [
-            # (category label, check label, function)
-            ("RBAC",           "Cluster-admin bindings",           self.check_rbac_cluster_admin_bindings),
-            ("RBAC",           "Wildcard permissions",              self.check_rbac_wildcard_rules),
-            ("RBAC",           "Anonymous access grants",           self.check_rbac_anonymous_access),
-            ("RBAC",           "Default SA role bindings",          lambda: self.check_rbac_default_sa_permissions(namespaces)),
-            ("API Server",     "Security flags",                    self.check_api_server_flags),
-            ("Scheduler",      "Security flags",                    self.check_scheduler_flags),
-            ("Ctrl Manager",   "Security flags",                    self.check_controller_manager_flags),
-            ("etcd",           "TLS & auth flags",                  self.check_etcd_flags),
-            ("Pod Security",   "Workload security contexts",        lambda: self.check_workload_security(namespaces)),
-            ("Network",        "NetworkPolicy coverage",            lambda: self.check_network_policies(namespaces)),
-            ("Secrets",        "Secrets in env vars",               lambda: self.check_secrets_in_env_vars(namespaces)),
-            ("Secrets",        "Default service accounts",          lambda: self.check_default_service_accounts(namespaces)),
-            ("Namespace",      "Workloads in default namespace",    self.check_workloads_in_default_namespace),
-            ("Namespace",      "Pod Security Standards labels",     lambda: self.check_pod_security_standards(namespaces)),
-            ("Namespace",      "ResourceQuota coverage",            lambda: self.check_resource_quotas(namespaces)),
-            ("Node",           "Node health",                       self.check_node_health),
-            ("Certificates",   "Issued CSR hygiene",                self.check_issued_certificates),
+            ("RBAC",          "Cluster-admin bindings",           self.check_rbac_cluster_admin_bindings),
+            ("RBAC",          "Wildcard permissions",              self.check_rbac_wildcard_rules),
+            ("RBAC",          "Anonymous access grants",           self.check_rbac_anonymous_access),
+            ("RBAC",          "Default SA role bindings",          lambda: self.check_rbac_default_sa_permissions(namespaces)),
+            ("API Server",    "Security flags",                    self.check_api_server_flags),
+            ("Scheduler",     "Security flags",                    self.check_scheduler_flags),
+            ("Ctrl Manager",  "Security flags",                    self.check_controller_manager_flags),
+            ("etcd",          "TLS & auth flags",                  self.check_etcd_flags),
+            ("Pod Security",  "Workload security contexts",        lambda: self.check_workload_security(namespaces)),
+            ("Network",       "NetworkPolicy coverage",            lambda: self.check_network_policies(namespaces)),
+            ("Secrets",       "Secrets in env vars",               lambda: self.check_secrets_in_env_vars(namespaces)),
+            ("Secrets",       "Default service accounts",          lambda: self.check_default_service_accounts(namespaces)),
+            ("Namespace",     "Workloads in default namespace",    self.check_workloads_in_default_namespace),
+            ("Namespace",     "Pod Security Standards labels",     lambda: self.check_pod_security_standards(namespaces)),
+            ("Namespace",     "ResourceQuota coverage",            lambda: self.check_resource_quotas(namespaces)),
+            ("Node",          "Node health",                       self.check_node_health),
+            ("Certificates",  "Issued CSR hygiene",                self.check_issued_certificates),
         ]
 
         cat_w = max(len(c[0]) for c in checks) + 3
@@ -973,15 +1050,20 @@ class SecurityAuditor:
             except Exception as exc:
                 print(f"{DIM}skipped ({exc}){RESET}")
                 continue
-            delta = len(self.report.findings) - before
-            if delta:
-                worst = sorted(
-                    [f.severity for f in self.report.findings[before:]],
-                    key=lambda s: SEVERITY_ORDER[s]
-                )[0]
-                print(f"{_C[worst]}{delta} findings{RESET}")
-            else:
+            new_findings  = self.report.findings[before:]
+            real_findings = [f for f in new_findings if not f.is_infra]
+            infra_findings = [f for f in new_findings if f.is_infra]
+
+            parts = []
+            if real_findings:
+                worst = sorted(real_findings, key=lambda f: SEVERITY_ORDER[f.severity])[0].severity
+                parts.append(f"{_C[worst]}{len(real_findings)} findings{RESET}")
+            if infra_findings:
+                parts.append(f"{GREY}{len(infra_findings)} infra{RESET}")
+            if not parts:
                 print(f"\033[32m✓ ok{RESET}")
+            else:
+                print("  ".join(parts))
 
         return self.report
 
@@ -990,23 +1072,40 @@ class SecurityAuditor:
 # Pretty-print report
 # ──────────────────────────────────────────────────────────────────────────────
 
-def print_report(report: AuditReport):
-    summary = report.summary()
-    total   = sum(summary.values())
-    n_checks = len({f.check_id for f in report.findings})
+def print_report(report: AuditReport, hide_infra: bool = False):
+    real_findings  = [f for f in report.findings if not f.is_infra]
+    infra_findings = [f for f in report.findings if f.is_infra]
+    summary        = report.summary()
+    total_real     = sum(summary.values())
+    n_checks_real  = len({f.check_id for f in real_findings})
 
+    # ── Summary block ─────────────────────────────────────────────────────────
     print(f"\n{'═'*72}")
     print(f"{BOLD}  SUMMARY  ·  {report.cluster_context}{RESET}")
     print(f"{'═'*72}")
     for sev in Severity:
         count = summary[sev.value]
+        if count == 0:
+            continue
         color = _C[sev]
         bar   = "█" * min(count, 46)
         print(f"  {color}{sev.value:<10}{RESET}  {count:>4}  {color}{bar}{RESET}")
-    print(f"\n  {BOLD}{total} findings{RESET} across {n_checks} check IDs\n")
 
+    if infra_findings:
+        infra_sum   = report.infra_summary()
+        infra_total = sum(infra_sum.values())
+        infra_parts = ", ".join(
+            f"{infra_sum[s.value]} {s.value}"
+            for s in Severity if infra_sum[s.value] > 0
+        )
+        print(f"\n  {GREY}System/Infra  {infra_total:>4}  ({infra_parts}){RESET}  "
+              f"{DIM}← shown separately below{RESET}")
+
+    print(f"\n  {BOLD}{total_real} actionable findings{RESET} across {n_checks_real} check IDs\n")
+
+    # ── Real findings by severity ─────────────────────────────────────────────
     for sev in Severity:
-        findings = [f for f in report.findings if f.severity == sev]
+        findings = [f for f in real_findings if f.severity == sev]
         if not findings:
             continue
         color = _C[sev]
@@ -1014,12 +1113,33 @@ def print_report(report: AuditReport):
         print(f"{color}{BOLD}  {sev.value}  ({len(findings)}){RESET}")
         print(f"{color}{BOLD}{'─'*72}{RESET}")
         for f in findings:
-            ns_part  = f"  ns={f.namespace}" if f.namespace else ""
-            ref_part = f"  {DIM}[{f.reference}]{RESET}" if f.reference else ""
-            print(f"\n  {BOLD}[{f.check_id}]{RESET}  {BOLD}{f.title}{RESET}{ns_part}")
-            print(f"  {DIM}Resource   :{RESET} {f.resource}")
-            print(f"  {DIM}Detail     :{RESET} {f.detail}")
-            print(f"  {DIM}Fix        :{RESET} {color}{f.remediation}{RESET}{ref_part}")
+            _print_finding(f, color)
+
+    # ── Infrastructure / system section ──────────────────────────────────────
+    if infra_findings and not hide_infra:
+        print(f"\n{GREY}{'─'*72}{RESET}")
+        print(f"{GREY}{BOLD}  SYSTEM / INFRASTRUCTURE COMPONENTS  ({len(infra_findings)} findings){RESET}")
+        print(f"{GREY}  These are known system workloads (CNI, CSI, cloud-controller, etc.).{RESET}")
+        print(f"{GREY}  Findings are expected / by design — kept for completeness.{RESET}")
+        print(f"{GREY}{'─'*72}{RESET}")
+
+        # Group by original severity for readability
+        for sev in Severity:
+            bucket = [f for f in infra_findings if f.severity == sev]
+            if not bucket:
+                continue
+            print(f"\n{GREY}  ── Originally {sev.value} ({len(bucket)}) ──{RESET}")
+            for f in bucket:
+                _print_finding(f, GREY)
+
+
+def _print_finding(f: Finding, color: str):
+    ns_part  = f"  {DIM}ns={f.namespace}{RESET}" if f.namespace else ""
+    ref_part = f"  {DIM}[{f.reference}]{RESET}"  if f.reference  else ""
+    print(f"\n  {color}{BOLD}[{f.check_id}]{RESET}  {BOLD}{f.title}{RESET}{ns_part}")
+    print(f"  {DIM}Resource   :{RESET} {f.resource}")
+    print(f"  {DIM}Detail     :{RESET} {f.detail}")
+    print(f"  {DIM}Fix        :{RESET} {color}{f.remediation}{RESET}{ref_part}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1032,13 +1152,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--context",    help="kubeconfig context to use")
-    parser.add_argument("--namespaces", nargs="*", metavar="NS",
-                        help="Limit scan to specific namespaces")
-    parser.add_argument("--output",     metavar="FILE",
-                        help="Save full JSON report to this file")
-    parser.add_argument("--json-only",  action="store_true",
+    parser.add_argument("--context",         help="kubeconfig context to use")
+    parser.add_argument("--namespaces",      nargs="*", metavar="NS",
+                        help="Scan only these namespaces")
+    parser.add_argument("--skip-namespaces", nargs="*", metavar="NS", default=[],
+                        help="Exclude these namespaces from the scan entirely")
+    parser.add_argument("--output",          metavar="FILE",
+                        help="Save full JSON report (includes infra findings) to this file")
+    parser.add_argument("--json-only",       action="store_true",
                         help="Print JSON to stdout instead of coloured output")
+    parser.add_argument("--hide-infra",      action="store_true",
+                        help="Omit the infrastructure components section from terminal output")
     args = parser.parse_args()
 
     try:
@@ -1057,20 +1181,23 @@ def main():
             print("ERROR: No kubeconfig found and not running in-cluster.")
             sys.exit(1)
 
-    auditor = SecurityAuditor(target_namespaces=args.namespaces)
-    report  = auditor.run(context_name)
+    auditor = SecurityAuditor(
+        target_namespaces=args.namespaces,
+        skip_namespaces=args.skip_namespaces,
+    )
+    report = auditor.run(context_name)
 
     if args.json_only:
         print(json.dumps(report.to_dict(), indent=2))
     else:
-        print_report(report)
+        print_report(report, hide_infra=args.hide_infra)
 
     if args.output:
         with open(args.output, "w") as fh:
             json.dump(report.to_dict(), fh, indent=2)
         print(f"\n  📄  JSON report saved → {args.output}\n")
 
-    # CI/CD-friendly exit codes
+    # Exit code based on real (non-infra) findings only
     summary = report.summary()
     if summary[Severity.CRITICAL.value]:
         sys.exit(3)
